@@ -1,0 +1,12 @@
+# Ambiente Virtual
+.venv/
+__pycache__/
+
+# Dados pesados (não enviar bases do PhysioNet)
+*.mat
+*.dat
+*.hea
+*.csv
+
+# Outros
+.vscode/
