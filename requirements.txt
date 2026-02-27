@@ -1,0 +1,8 @@
+mne
+pyedflib
+pandas
+numpy
+matplotlib
+scipy
+kaggle
+kagglehub

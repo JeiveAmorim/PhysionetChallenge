@@ -1,12 +1,15 @@
-# Ambiente Virtual
+# Ambiente e Python
 .venv/
 __pycache__/
+*.pyc
 
-# Dados pesados (não enviar bases do PhysioNet)
-*.mat
+# Dados Pesados (Arquivos de Polissonografia)
+data/
+*.edf
+*.rec
 *.dat
 *.hea
-*.csv
 
 # Outros
+.ipynb_checkpoints/
 .vscode/
