@@ -1,6 +1,11 @@
 import kagglehub
+import os
 
-# Download latest version
+# 1. Verifica se o Python está vendo a pasta no D:
+cache_path = os.getenv('KAGGLEHUB_CACHE')
+print(f"O download irá para: {cache_path}")
+
+# 2. Comando de download (ele vai detectar os arquivos movidos e continuar)
 path = kagglehub.dataset_download("physionet/physionetchallenge2026data")
 
-print("Path to dataset files:", path)
+print("Download concluído com sucesso em:", path)
