@@ -1,14 +1,3 @@
-#!/usr/bin/env python
-
-# Edit this script to add your team's code. Some functions are *required*, but you can edit most parts of the required functions,
-# change or remove non-required functions, and add your own functions.
-
-################################################################################
-#
-# Optional libraries, functions, and variables. You can change or remove them.
-#
-################################################################################
-
 import joblib
 import numpy as np
 import os
@@ -17,6 +6,7 @@ import sys
 from tqdm import tqdm
 
 from helper_code import *
+
 
 ################################################################################
 # Path & Constant Configuration (Added for Robustness)
@@ -27,181 +17,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Build the absolute path to the CSV file relative to the script location
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
-
-
-################################################################################
-#
-# Required functions. Edit these functions to add your code, but do not change the arguments for the functions.
-#
-################################################################################
-
-# Train your models. This function is *required*. You should edit this function to add your code, but do *not* change the arguments
-# of this function. If you do not train one of the models, then you can return None for the model.
-
-# Train your model.
-def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
-    # Find the data files.
-    if verbose:
-        print('Finding the Challenge data...')
-
-    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-    patient_metadata_list = find_patients(patient_data_file)
-    num_records = len(patient_metadata_list)
-
-    if num_records == 0:
-        raise FileNotFoundError('No data were provided.')
-
-    # Extract the features and labels from the data.
-    if verbose:
-        print('Extracting features and labels from the data...')
-
-    # Iterate over the records to extract the features and labels.
-    features = list()
-    labels = list()
-    
-    pbar = tqdm(range(num_records), desc="Extracting Features", unit="record", disable=not verbose)
-    for i in pbar:
-        try:
-            # Extract identifiers for this specific record
-            record = patient_metadata_list[i]
-            patient_id = record[HEADERS['bids_folder']]
-            site_id    = record[HEADERS['site_id']]
-            session_id = record[HEADERS['session_id']]
-
-            if verbose:
-                pbar.set_postfix({"patient": patient_id})
-
-            # Load the patient data.
-            patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-            patient_data = load_demographics(patient_data_file, patient_id, session_id)
-            demographic_features = extract_demographic_features(patient_data)
-
-            # Load signal data.
-
-            # Load the physiological signal.
-            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-            # --- Check if the file actually exists before proceeding ---
-            if not os.path.exists(physiological_data_file):
-                if verbose:
-                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
-                continue # skip record
-            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
-            physiological_features = extract_physiological_features(physiological_data, physiological_fs, csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
-
-            # Load the algorithmic annotations.
-            algorithmic_annotations_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
-            algorithmic_annotations, algorithmic_fs = load_signal_data(algorithmic_annotations_file)
-            algorithmic_features = extract_algorithmic_annotations_features(algorithmic_annotations)
-
-            # Load the human annotations; these data will not be available in the hidden validation and test sets.
-            human_annotations_file = os.path.join(data_folder, HUMAN_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_expert_annotations.edf")
-            human_annotations, human_fs = load_signal_data(human_annotations_file)
-            human_features = extract_human_annotations_features(human_annotations)
-
-            # Load the diagnoses; these data will not be available in the hidden validation and test sets.
-            diagnosis_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-            label = load_diagnoses(diagnosis_file, patient_id)
-
-            # Store the features and labels, but
-            # the human annotations are not available on the hidden validation and test sets, but you
-            # may want to consider how to use them for training.
-            if label == 0 or label == 1:
-                features.append(np.hstack([demographic_features, physiological_features, algorithmic_features]))
-                labels.append(label)
-
-            if 'physiological_data' in locals(): del physiological_data
-            if 'algorithmic_annotations' in locals(): del algorithmic_annotations
-
-        except Exception as e:
-            # If an error occurs (e.g., a record is corrupted), log it and move to the next
-            tqdm.write(f"  !!! Error processing record {i+1} ({patient_id}): {e}")
-            continue
-
-    pbar.close()
-
-    features = np.asarray(features, dtype=np.float32)
-    labels = np.asarray(labels, dtype=bool)
-
-    # Train the models on the features.
-    if verbose:
-        print('Training the model on the data...')
-
-    # This very simple model trains a random forest model with very simple features.
-
-    # Define the parameters for the random forest classifier and regressor.
-    n_estimators = 12  # Number of trees in the forest.
-    max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
-    random_state = 56  # Random state; set for reproducibility.
-
-    # Fit the model.
-    model = RandomForestClassifier(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-
-    # Create a folder for the model if it does not already exist.
-    os.makedirs(model_folder, exist_ok=True)
-
-    # Save the model.
-    save_model(model_folder, model)
-
-    if verbose:
-        print('Done.')
-        print()
-
-# Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
-# arguments of this function. If you do not train one of the models, then you can return None for the model.
-def load_model(model_folder, verbose):
-    model_filename = os.path.join(model_folder, 'model.sav')
-    model = joblib.load(model_filename)
-    return model
-
-# Run your trained model. This function is *required*. You should edit this function to add your code, but do *not* change the
-# arguments of this function.
-def run_model(model, record, data_folder, verbose):
-    # Load the model.
-    model = model['model']
-
-    # Extract identifiers from the record dictionary
-    patient_id = record[HEADERS['bids_folder']]
-    site_id    = record[HEADERS['site_id']]
-    session_id = record[HEADERS['session_id']]
-
-    # Load the patient data.
-    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-    patient_data = load_demographics(patient_data_file, patient_id, session_id)
-    demographic_features = extract_demographic_features(patient_data)
-
-    # Load signal data.
-    phys_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-    if os.path.exists(phys_file):
-        phys_data, phys_fs = load_signal_data(phys_file)
-        # Ensure csv_path is accessible or defined
-        physiological_features = extract_physiological_features(phys_data, phys_fs)
-    else:
-        # Fallback to zeros if file is missing (length 49)
-        physiological_features = np.zeros(49)
-
-    # Load Algorithmic Annotations
-    algo_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
-    if os.path.exists(algo_file):
-        algo_data, _ = load_signal_data(algo_file)
-        algorithmic_features = extract_algorithmic_annotations_features(algo_data)
-    else:
-        # Fallback to zeros (length 12)
-        algorithmic_features = np.zeros(12)
-
-    features = np.hstack([demographic_features, physiological_features, algorithmic_features]).reshape(1, -1)
-
-    # Get the model outputs.
-    binary_output = model.predict(features)[0]
-    probability_output = model.predict_proba(features)[0][1]
-
-    return binary_output, probability_output
-
-################################################################################
-#
-# Optional functions. You can change or remove these functions and/or add new functions.
-#
-################################################################################
 
 def extract_demographic_features(data):
     """
@@ -533,9 +348,124 @@ def extract_human_annotations_features(human_data):
 
     return np.array(features)
 
-
 # Save your trained model.
 def save_model(model_folder, model):
     d = {'model': model}
     filename = os.path.join(model_folder, 'model.sav')
     joblib.dump(d, filename, protocol=0)
+
+
+if __name__ == '__main__':
+    # def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
+    # Find the data files.
+    data_folder = 'data\\training_set'
+    model_folder = 'model'
+    csv_path=DEFAULT_CSV_PATH
+    verbose = True
+
+    if verbose:
+        print('Finding the Challenge data...')
+
+    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+    patient_metadata_list = find_patients(patient_data_file)
+    num_records = len(patient_metadata_list)
+
+    if num_records == 0:
+        raise FileNotFoundError('No data were provided.')
+
+    # Extract the features and labels from the data.
+    if verbose:
+        print('Extracting features and labels from the data...')
+
+    # Iterate over the records to extract the features and labels.
+    features = list()
+    labels = list()
+
+    pbar = tqdm(range(num_records), desc="Extracting Features", unit="record", disable=not verbose)
+    for i in pbar:
+        try:
+            # Extract identifiers for this specific record
+            record = patient_metadata_list[i]
+            patient_id = record[HEADERS['bids_folder']]
+            site_id    = record[HEADERS['site_id']]
+            session_id = record[HEADERS['session_id']]
+
+            if verbose:
+                pbar.set_postfix({"patient": patient_id})
+
+            # Load the patient data.
+            patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+            patient_data = load_demographics(patient_data_file, patient_id, session_id)
+            demographic_features = extract_demographic_features(patient_data)
+
+            # Load signal data.
+
+            # Load the physiological signal.
+            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
+            # --- Check if the file actually exists before proceeding ---
+            if not os.path.exists(physiological_data_file):
+                if verbose:
+                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
+                continue # skip record
+            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
+            physiological_features = extract_physiological_features(physiological_data, physiological_fs, csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
+
+            # Load the algorithmic annotations.
+            algorithmic_annotations_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
+            algorithmic_annotations, algorithmic_fs = load_signal_data(algorithmic_annotations_file)
+            algorithmic_features = extract_algorithmic_annotations_features(algorithmic_annotations)
+
+            # Load the human annotations; these data will not be available in the hidden validation and test sets.
+            human_annotations_file = os.path.join(data_folder, HUMAN_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_expert_annotations.edf")
+            human_annotations, human_fs = load_signal_data(human_annotations_file)
+            human_features = extract_human_annotations_features(human_annotations)
+
+            # Load the diagnoses; these data will not be available in the hidden validation and test sets.
+            diagnosis_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+            label = load_diagnoses(diagnosis_file, patient_id)
+
+            # Store the features and labels, but
+            # the human annotations are not available on the hidden validation and test sets, but you
+            # may want to consider how to use them for training.
+            if label == 0 or label == 1:
+                # # Tirando as features fisiológicas
+                # features.append(np.hstack([demographic_features, physiological_features, algorithmic_features]))
+                features.append(np.hstack([demographic_features, algorithmic_features]))
+                labels.append(label)
+
+            if 'physiological_data' in locals(): del physiological_data
+            if 'algorithmic_annotations' in locals(): del algorithmic_annotations
+
+        except Exception as e:
+            # If an error occurs (e.g., a record is corrupted), log it and move to the next
+            tqdm.write(f"  !!! Error processing record {i+1} ({patient_id}): {e}")
+            continue
+
+    pbar.close()
+
+    features = np.asarray(features, dtype=np.float32)
+    labels = np.asarray(labels, dtype=bool)
+
+    if verbose:
+        print('Training the model on the data...')
+
+    # This very simple model trains a random forest model with very simple features.
+
+    # Define the parameters for the random forest classifier and regressor.
+    n_estimators = 12  # Number of trees in the forest.
+    max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
+    random_state = 56  # Random state; set for reproducibility.
+
+    # Fit the model.
+    model = RandomForestClassifier(
+        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
+
+    # Create a folder for the model if it does not already exist.
+    os.makedirs(model_folder, exist_ok=True)
+
+    # Save the model.
+    save_model(model_folder, model)
+
+    if verbose:
+        print('Done.')
+        print()
