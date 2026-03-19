@@ -34,6 +34,7 @@ def extract_demographic_features(data):
     """
     # 1. Age Feature (1 dimension)
     # Convert 'Age' to a float; default to 0 if missing
+    # Thats the age of patient at the time of the recording, which is a critical factor in sleep disorders and physiology.
     age = np.array([load_age(data)])
 
     # 2. Sex One-Hot Encoding (3 dimensions: Female, Male, Other/Unknown)
