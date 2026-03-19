@@ -34,6 +34,7 @@ def extract_demographic_features(data):
     """
     # 1. Age Feature (1 dimension)
     # Convert 'Age' to a float; default to 0 if missing
+    # Thats the age of patient at the time of the recording, which is a critical factor in sleep disorders and physiology.
     age = np.array([load_age(data)])
 
     # 2. Sex One-Hot Encoding (3 dimensions: Female, Male, Other/Unknown)
@@ -66,6 +67,10 @@ def extract_demographic_features(data):
 def extract_physiological_features(physiological_data, physiological_fs, csv_path=DEFAULT_CSV_PATH):
     """
     Standardizes channels and extracts statistical/spectral features.
+    Inputs:
+        physiological_data (dict): Raw signal data with original channel labels as keys.
+        physiological_fs (dict): Sampling rates for each channel.
+        csv_path (str): Path to the CSV file containing renaming rules.
     """
     original_labels = list(physiological_data.keys())
 
