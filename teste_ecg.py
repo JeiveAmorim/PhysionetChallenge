@@ -43,19 +43,20 @@ def extract_hrv_features(sig, fs, target_fs=250):
     if len(r_peaks) > 20:
         
         hrv_freq_metrics = nk.hrv_frequency(peaks_info, sampling_rate=fs)
-        hrv_time_metrics = nk.hrv_time(peaks_info, sampling_rate=fs)
+        # hrv_time_metrics = nk.hrv_time(peaks_info, sampling_rate=fs)
         
         
         # Extraindo apenas o que importa para o modelo de cognição
         return [
-            hrv_time_metrics["RMSSD"].values[0],
-            hrv_time_metrics["SDNN"].values[0],
-            hrv_time_metrics["pNN50"].values[0],
+            # hrv_time_metrics["RMSSD"].values[0],
+            # hrv_time_metrics["SDNN"].values[0],
+            # hrv_time_metrics["pNN50"].values[0],
             hrv_freq_metrics["HRV_VLF"].values[0],
             hrv_freq_metrics["HRV_LFHF"].values[0]
         ]
     
-    return [0.0, 0.0, 0.0, 0.0, 0.0]
+    # return [0.0, 0.0, 0.0, 0.0, 0.0]
+    return [0.0, 0.0]
 
 def extract_physiological_features(physiological_data, physiological_fs, csv_path=DEFAULT_CSV_PATH):
     """
