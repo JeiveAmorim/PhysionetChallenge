@@ -4,6 +4,8 @@ import os
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import sys
 from tqdm import tqdm
+import scipy.signal as signal
+import neurokit2 as nk
 
 from helper_code import *
 
@@ -18,59 +20,46 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Build the absolute path to the CSV file relative to the script location
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 
-def extract_demographic_features(data):
+def extract_hrv_features(sig, fs, target_fs=250):
     """
-    Extracts and encodes demographic features from a metadata dictionary.
-    
-    Inputs:
-        data (dict): A dictionary containing patient metadata (e.g., from a CSV row).
-    
-    Returns:
-        np.array: A feature vector of length 11:
-            - [0]: Age (Continuous)
-            - [1:4]: Sex (One-hot: Female, Male, Other/Unknown)
-            - [4:9]: Race (One-hot: Asian, Black, Other, Unavailable, White)
-            - [9]: BMI (Continuous)
+    Versão otimizada para sinais longos (PSG).
     """
-    # 1. Age Feature (1 dimension)
-    # Convert 'Age' to a float; default to 0 if missing
-    # Thats the age of patient at the time of the recording, which is a critical factor in sleep disorders and physiology.
-    age = np.array([load_age(data)])
+    # 1. Downsampling para economizar CPU
+    if fs > target_fs:
+        sig = nk.signal_resample(sig, sampling_rate=fs, desired_sampling_rate=target_fs)
+        fs = target_fs
 
-    # 2. Sex One-Hot Encoding (3 dimensions: Female, Male, Other/Unknown)
-    # Uses lowercase prefix matching to handle variants like 'F', 'Female', 'M', or 'Male'
-    sex = load_sex(data)
-    sex_vec = np.zeros(3)
-    if sex == 'Female': 
-        sex_vec[0] = 1 # Index 0: Female
-    elif sex == 'Male': 
-        sex_vec[1] = 1 # Index 1: Male
-    else: 
-        sex_vec[2] = 1 # Index 2: Other/Unknown
+    # 2. Limpeza "Lite" (apenas o necessário para picos R)
+    # Em vez de ecg_process, usamos apenas o ecg_clean
+    cleaned = nk.ecg_clean(sig, sampling_rate=fs, method="neurokit")
 
-    # 3. Race One-Hot Encoding (6 dimensions)
-    # Standardizes the raw text into one of six categories using the helper function
-    race_category = get_standardized_race(data).lower()
-    race_vec = np.zeros(5)
-    # Pre-defined mapping for index consistency
-    race_mapping = {'asian': 0, 'black': 1, 'others': 2, 'unavailable': 3, 'white': 4}
-    race_vec[race_mapping.get(race_category, 2)] = 1
+    # 3. Detecção de Picos R (Rápida)
+    # O método 'pantompkins1985' é muito performático para sinais longos
+    peaks_info = nk.ecg_peaks(cleaned, sampling_rate=fs, method="pantompkins1985")[1]
+    r_peaks = peaks_info["ECG_R_Peaks"]
 
-    # 4. Body Mass Index (BMI) Feature (1 dimension)
-    # Extracts the pre-calculated mean BMI; handles strings, NaNs, and missing keys
-    bmi = np.array([load_bmi(data)])
-
-    # 5. Concatenate all components into a single vector (1 + 3 + 5 + 1 = 10)
+    # 4. Cálculo de HRV direto dos picos
+    # Isso pula toda a análise de ondas P e T que o ecg_process faz
+    if len(r_peaks) > 20:
+        
+        hrv_freq_metrics = nk.hrv_frequency(peaks_info, sampling_rate=fs)
+        hrv_time_metrics = nk.hrv_time(peaks_info, sampling_rate=fs)
+        
+        
+        # Extraindo apenas o que importa para o modelo de cognição
+        return [
+            hrv_time_metrics["RMSSD"].values[0],
+            hrv_time_metrics["SDNN"].values[0],
+            hrv_time_metrics["pNN50"].values[0],
+            hrv_freq_metrics["HRV_VLF"].values[0],
+            hrv_freq_metrics["HRV_LFHF"].values[0]
+        ]
     
-    return np.concatenate([age, sex_vec, race_vec, bmi])
+    return [0.0, 0.0, 0.0, 0.0, 0.0]
 
 def extract_physiological_features(physiological_data, physiological_fs, csv_path=DEFAULT_CSV_PATH):
     """
     Standardizes channels and extracts statistical/spectral features.
-    Inputs:
-        physiological_data (dict): Raw signal data with original channel labels as keys.
-        physiological_fs (dict): Sampling rates for each channel.
-        csv_path (str): Path to the CSV file containing renaming rules.
     """
     original_labels = list(physiological_data.keys())
 
@@ -148,65 +137,23 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
                 sig = processed_channels[candidate]
                 fs = processed_fs.get(candidate)
                 break 
+        
+        if lead_type == 'ecg' and sig is not None:
+            # Se for ECG, além das estatísticas básicas, extraímos HRV
+            hrv_features = extract_hrv_features(sig, fs)
+            final_features.extend(hrv_features)
 
-        # if sig is not None and len(sig) > 0 and fs is not None:
-        #     # --- 1. Time Domain Features ---
-        #     std_val = np.std(sig)
-        #     mav_val = np.mean(np.abs(sig))
-        #     energy_val = np.sum(sig**2) / len(sig)
+        if lead_type == 'chin' and sig is not None:
+            chin_features = extract_chin_features(sig, fs)
+            final_features.extend(chin_features)
             
-        #     # --- 2. Frequency Domain Features (Spectral) ---
-        #     n = len(sig)
-        #     # Correct spacing for frequency axis based on channel-specific fs
-        #     freqs = np.fft.rfftfreq(n, d=1/fs)
+            # Adiciona também as estatísticas rápidas que você já tinha
+            # (std, mav, zcr, rms, activity, mobility, complexity)
+            # ... seu código de sig.std() etc ...
+        # elif sig is not None:
+            # Para outros canais (EEG, EOG), mantém apenas o processamento padrão
+            # ... seu código padrão ...
             
-        #     # Compute Power Spectral Density (PSD)
-        #     # Multiplied by 2 for rfft (except DC/Nyquist) and divided by fs for density
-        #     fft_res = np.abs(np.fft.rfft(sig))
-        #     psd = (fft_res**2) / (n * fs)
-            
-        #     # Define band masks
-        #     delta_mask = (freqs >= 0.5) & (freqs <= 4)
-        #     theta_mask = (freqs > 4) & (freqs <= 8)
-        #     alpha_mask = (freqs > 8) & (freqs <= 12)
-            
-        #     # Calculate power in bands using trapezoidal integration for physical accuracy
-        #     delta_p = np.trapezoid(psd[delta_mask], freqs[delta_mask]) if np.any(delta_mask) else 0.0
-        #     theta_p = np.trapezoid(psd[theta_mask], freqs[theta_mask]) if np.any(theta_mask) else 0.0
-        #     alpha_p = np.trapezoid(psd[alpha_mask], freqs[alpha_mask]) if np.any(alpha_mask) else 0.0
-            
-        #     # Ratio biomarker: Delta/Theta (Indicator of cognitive slowing)
-        #     dt_ratio = delta_p / theta_p if theta_p > 0 else 0.0
-
-        #     final_features.extend([std_val, mav_val, energy_val, delta_p, theta_p, alpha_p, dt_ratio])
-
-        if sig is not None and len(sig) > 1:
-            # --- Time Domain Features (Very Fast) ---
-            std_val = np.std(sig)
-            mav_val = np.mean(np.abs(sig))
-            
-            # Zero Crossing Rate (Proxy for frequency/slowing)
-            zcr = np.mean(np.diff(np.sign(sig)) != 0)
-            
-            # Root Mean Square
-            rms = np.sqrt(np.mean(sig**2))
-            
-            # Signal Activity (Variance)
-            activity = np.var(sig)
-            
-            # Mobility (Hjorth Parameter) - Proxy for mean frequency
-            # sqrt(var(diff(sig)) / var(sig))
-            diff_sig = np.diff(sig)
-            mobility = np.sqrt(np.var(diff_sig) / activity) if activity > 0 else 0.0
-
-            # Complexity (Hjorth Parameter) - Proxy for bandwidth
-            diff2_sig = np.diff(diff_sig)
-            var_d2 = np.var(diff2_sig)
-            var_d1 = np.var(diff_sig)
-            complexity = (np.sqrt(var_d2 / var_d1) / mobility) if (var_d1 > 0 and mobility > 0) else 0.0
-
-            final_features.extend([std_val, mav_val, zcr, rms, activity, mobility, complexity])
-
         else:
             # Padding: 7 features per lead type
             final_features.extend([0.0] * 7)
@@ -214,6 +161,51 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
     if 'processed_channels' in locals(): del processed_channels
 
     return np.array(final_features)
+
+def extract_demographic_features(data):
+    """
+    Extracts and encodes demographic features from a metadata dictionary.
+    
+    Inputs:
+        data (dict): A dictionary containing patient metadata (e.g., from a CSV row).
+    
+    Returns:
+        np.array: A feature vector of length 10:
+            - [0]: Age (Continuous)
+            - [1:4]: Sex (One-hot: Female, Male, Other/Unknown)
+            - [4:9]: Race (One-hot: Asian, Black, Other, Unavailable, White)
+            - [9]: BMI (Continuous)
+    """
+    # 1. Age Feature (1 dimension)
+    # Convert 'Age' to a float; default to 0 if missing
+    age = np.array([load_age(data)])
+
+    # 2. Sex One-Hot Encoding (3 dimensions: Female, Male, Other/Unknown)
+    # Uses lowercase prefix matching to handle variants like 'F', 'Female', 'M', or 'Male'
+    sex = load_sex(data)
+    sex_vec = np.zeros(3)
+    if sex == 'Female': 
+        sex_vec[0] = 1 # Index 0: Female
+    elif sex == 'Male': 
+        sex_vec[1] = 1 # Index 1: Male
+    else: 
+        sex_vec[2] = 1 # Index 2: Other/Unknown
+
+    # 3. Race One-Hot Encoding (6 dimensions)
+    # Standardizes the raw text into one of six categories using the helper function
+    race_category = get_standardized_race(data).lower()
+    race_vec = np.zeros(5)
+    # Pre-defined mapping for index consistency
+    race_mapping = {'asian': 0, 'black': 1, 'others': 2, 'unavailable': 3, 'white': 4}
+    race_vec[race_mapping.get(race_category, 2)] = 1
+
+    # 4. Body Mass Index (BMI) Feature (1 dimension)
+    # Extracts the pre-calculated mean BMI; handles strings, NaNs, and missing keys
+    bmi = np.array([load_bmi(data)])
+
+    # 5. Concatenate all components into a single vector (1 + 3 + 5 + 1 = 10)
+    
+    return np.concatenate([age, sex_vec, race_vec, bmi])
 
 def extract_algorithmic_annotations_features(algo_data):
     """
@@ -405,7 +397,7 @@ if __name__ == '__main__':
 
             # Load signal data.
 
-            # Load the physiological signal.
+            # # Load the physiological signal.
             physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
             # --- Check if the file actually exists before proceeding ---
             if not os.path.exists(physiological_data_file):
