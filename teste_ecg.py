@@ -5,7 +5,9 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import sys
 from tqdm import tqdm
 import scipy.signal as signal
+import scipy as scipy
 import neurokit2 as nk
+import time
 
 from helper_code import *
 
@@ -20,52 +22,111 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Build the absolute path to the CSV file relative to the script location
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 
-def extract_hrv_features(sig, fs, target_fs=250):
+def extract_hrv_features(sig, fs, sleep_stages, sleep_stages_fs):
     """
-    Versão otimizada para sinais longos (PSG).
+    Extrai features de tempo e frequência (HRV) para cada estágio do sono.
+    Mapeamento: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake.
+    Retorna um vetor fixo de 25 posições (5 features x 5 estágios).
     """
-    # 1. Downsampling para economizar CPU
-    if fs > target_fs:
-        sig = nk.signal_resample(sig, sampling_rate=fs, desired_sampling_rate=target_fs)
-        fs = target_fs
+    # Se não tiver dados suficientes, retorna o vetor zerado (25 features)
+    if sig is None or len(sig) < fs * 60 or len(sleep_stages) == 0:
+        return [0.0] * 25
 
-    # 2. Limpeza "Lite" (apenas o necessário para picos R)
-    # Em vez de ecg_process, usamos apenas o ecg_clean
-    cleaned = nk.ecg_clean(sig, sampling_rate=fs, method="neurokit")
-
-    # 3. Detecção de Picos R (Rápida)
-    # O método 'pantompkins1985' é muito performático para sinais longos
-    peaks_info = nk.ecg_peaks(cleaned, sampling_rate=fs, method="pantompkins1985")[1]
-    r_peaks = peaks_info["ECG_R_Peaks"]
-
-    # 4. Cálculo de HRV direto dos picos
-    # Isso pula toda a análise de ondas P e T que o ecg_process faz
-    if len(r_peaks) > 20:
+    try:
+        # 1. Detecção de Picos R super rápida (Pan-Tompkins)
+        peaks_info = nk.ecg_peaks(sig, sampling_rate=fs, method="pantompkins1985")[1]
+        r_peaks = peaks_info["ECG_R_Peaks"]
         
-        hrv_freq_metrics = nk.hrv_frequency(peaks_info, sampling_rate=fs)
-        # hrv_time_metrics = nk.hrv_time(peaks_info, sampling_rate=fs)
-        
-        
-        # Extraindo apenas o que importa para o modelo de cognição
-        return [
-            # hrv_time_metrics["RMSSD"].values[0],
-            # hrv_time_metrics["SDNN"].values[0],
-            # hrv_time_metrics["pNN50"].values[0],
-            hrv_freq_metrics["HRV_VLF"].values[0],
-            hrv_freq_metrics["HRV_LFHF"].values[0]
-        ]
-    
-    # return [0.0, 0.0, 0.0, 0.0, 0.0]
-    return [0.0, 0.0]
+        if len(r_peaks) < 10:
+            return [0.0] * 25
 
-def extract_physiological_features(physiological_data, physiological_fs, csv_path=DEFAULT_CSV_PATH):
+        # 2. Calcular os Intervalos RR e seus Timestamps
+        rr_times = r_peaks[:-1] / fs  # Em segundos
+        rr_intervals = np.diff(r_peaks) * (1000.0 / fs)  # Em milissegundos
+
+        # 3. Filtro de Sanidade (Remove ruídos de movimento que quebram o HRV)
+        valid_mask = (rr_intervals > 300) & (rr_intervals < 2000)
+        rr_times = rr_times[valid_mask]
+        rr_intervals = rr_intervals[valid_mask]
+
+        # 4. Encontrar o estágio do sono para cada intervalo RR
+        # Época = tempo * frequência_de_amostragem_das_anotações
+        stage_indices = np.floor(rr_times * sleep_stages_fs).astype(int)
+        
+        # Garante que não ultrapassamos o tamanho do array de estágios
+        stage_indices = np.clip(stage_indices, 0, len(sleep_stages) - 1)
+        rr_stages = sleep_stages[stage_indices]
+
+        # 5. Extração de Features Agrupadas por Estágio
+        features = []
+        target_stages = [1, 2, 3, 4, 5] # N3, N2, N1, REM, Wake
+
+        for stage in target_stages:
+            mask = (rr_stages == stage)
+            stage_rrs = rr_intervals[mask]
+            stage_times = rr_times[mask]
+
+            # Se houver pelo menos 20 batimentos válidos neste estágio
+            if len(stage_rrs) > 20:
+                # --- Domínio do Tempo ---
+                sdnn = np.std(stage_rrs, ddof=1)
+                rmssd = np.sqrt(np.mean(np.square(np.diff(stage_rrs))))
+                
+                # --- Domínio da Frequência (Requer Interpolação) ---
+                # Garante que não há tempos duplicados para a interpolação funcionar
+                _, unique_idx = np.unique(stage_times, return_index=True)
+                t_clean = stage_times[unique_idx]
+                rr_clean = stage_rrs[unique_idx]
+
+                if len(t_clean) > 20:
+                    # Interpola para 4Hz (padrão ouro em HRV)
+                    fs_interp = 4.0
+                    t_interp = np.arange(t_clean[0], t_clean[-1], 1.0/fs_interp)
+                    f_interp = scipy.interpolate.interp1d(t_clean, rr_clean, kind='cubic', fill_value='extrapolate')
+                    rr_interp = f_interp(t_interp)
+
+                    # Welch's Periodogram
+                    f, pxx = signal.welch(rr_interp, fs=fs_interp, nperseg=min(256, len(rr_interp)))
+                    
+                    df = f[1] - f[0]
+                    lf = np.sum(pxx[(f >= 0.04) & (f <= 0.15)]) * df
+                    hf = np.sum(pxx[(f >= 0.15) & (f <= 0.40)]) * df
+                    lf_hf = lf / hf if hf > 0 else 0.0
+                else:
+                    lf, hf, lf_hf = 0.0, 0.0, 0.0
+
+                features.extend([rmssd, sdnn, lf, hf, lf_hf])
+            else:
+                # Paciente não teve esse estágio do sono ou sinal estava muito ruim
+                features.extend([0.0] * 5)
+        
+        return features
+
+    except Exception as e:
+        # Silencia erros para não quebrar o script de avaliação no servidor
+        return [0.0] * 25
+
+def extract_physiological_features(physiological_data, physiological_fs, algorithmic_annotations, algorithmic_fs, csv_path=DEFAULT_CSV_PATH):
     """
     Standardizes channels and extracts statistical/spectral features.
+    Inputs:
+        physiological_data (dict): Raw signal data with original channel labels as keys.
+        physiological_fs (dict): Sampling rates for each channel.
+        algorithmic_annotations (dict): Algorithmic features (like sleep stages).
+        algorithmic_fs (dict): Sampling rates for algorithmic annotations.
+        csv_path (str): Path to the CSV file containing renaming rules.
     """
+    # === 1. Extração Segura dos Estágios do Sono ===
+    if algorithmic_annotations is not None and 'stage_caisr' in algorithmic_annotations:
+        sleep_stages = algorithmic_annotations['stage_caisr']
+        sleep_stages_fs = algorithmic_fs.get('stage_caisr', 1/30.0)
+    else:
+        sleep_stages = np.array([])
+        sleep_stages_fs = 1/30.0
+
     original_labels = list(physiological_data.keys())
 
     # Step 1: Load rules and standardize names
-    # Note: Use script-relative path or absolute path for robustness
     rename_rules = load_rename_rules(os.path.abspath(csv_path))
     rename_map, cols_to_drop = standardize_channel_names_rename_only(original_labels, rename_rules)
 
@@ -77,8 +138,7 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
             continue
         new_label = rename_map.get(old_label, old_label.lower())
         processed_channels[new_label] = data
-        # Mapping the sampling rate to the new label
-        processed_fs[new_label] = physiological_fs.get(old_label, 200.0) # Default to 200 if missing
+        processed_fs[new_label] = physiological_fs.get(old_label, 200.0) 
     
     if 'physiological_data' in locals(): del physiological_data
 
@@ -93,24 +153,19 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
     ]
 
     for target, pos, neg_list in bipolar_configs:
-        # 1. Skip if target already exists or pos channel missing
         if target in processed_channels or pos not in processed_channels:
             continue
         
-        # 2. Check all neg channels exist
         if not all(n in processed_channels for n in neg_list):
             continue
 
-        # 3. Check sampling rate consistency
         all_involved = [pos] + neg_list
         fs_values = [processed_fs[ch] for ch in all_involved]
         
         if len(set(fs_values)) > 1:
             raise ValueError(f"Sampling rate mismatch for {target}: {dict(zip(all_involved, fs_values))}")
 
-        # 4. Derive bipolar signal
         ref_sig = processed_channels[neg_list[0]] if len(neg_list) == 1 else tuple(processed_channels[n] for n in neg_list)
-        
         derived = derive_bipolar_signal(processed_channels[pos], ref_sig)
         
         if derived is not None:
@@ -124,7 +179,7 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
         'leg':  ['lat', 'rat'],
         'ecg':  ['ecg', 'ekg'],
         'resp': ['airflow', 'ptaf', 'abd', 'chest'],
-        'spo2': ['spo2', 'sao2'] # Added sao2 as fallback for spo2
+        'spo2': ['spo2', 'sao2']
     }
     
     final_features = []
@@ -138,26 +193,38 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
                 sig = processed_channels[candidate]
                 fs = processed_fs.get(candidate)
                 break 
-        
-        if lead_type == 'ecg' and sig is not None:
-            # Se for ECG, além das estatísticas básicas, extraímos HRV
-            hrv_features = extract_hrv_features(sig, fs)
-            final_features.extend(hrv_features)
 
-        if lead_type == 'chin' and sig is not None:
-            chin_features = extract_chin_features(sig, fs)
-            final_features.extend(chin_features)
-            
-            # Adiciona também as estatísticas rápidas que você já tinha
-            # (std, mav, zcr, rms, activity, mobility, complexity)
-            # ... seu código de sig.std() etc ...
-        # elif sig is not None:
-            # Para outros canais (EEG, EOG), mantém apenas o processamento padrão
-            # ... seu código padrão ...
-            
+        # === 4. Extração de Features Modificada ===
+        if sig is not None and len(sig) > 1 and fs is not None:
+            if lead_type == 'ecg':
+                # Extrai as 25 features de HRV específicas por estágio do sono
+                hrv_features = extract_hrv_features(sig, fs, sleep_stages, sleep_stages_fs)
+                final_features.extend(hrv_features)
+
+            # else:
+                # # Processamento Padrão de 7 features para os outros canais
+                # std_val = np.std(sig)
+                # mav_val = np.mean(np.abs(sig))
+                # zcr = np.mean(np.diff(np.sign(sig)) != 0)
+                # rms = np.sqrt(np.mean(sig**2))
+                # activity = np.var(sig)
+                
+                # diff_sig = np.diff(sig)
+                # mobility = np.sqrt(np.var(diff_sig) / activity) if activity > 0 else 0.0
+
+                # diff2_sig = np.diff(diff_sig)
+                # var_d2 = np.var(diff2_sig)
+                # var_d1 = np.var(diff_sig)
+                # complexity = (np.sqrt(var_d2 / var_d1) / mobility) if (var_d1 > 0 and mobility > 0) else 0.0
+
+                # final_features.extend([std_val, mav_val, zcr, rms, activity, mobility, complexity])
+
         else:
-            # Padding: 7 features per lead type
-            final_features.extend([0.0] * 7)
+            # Padding Condicional: Garante que o vetor de features tenha sempre o mesmo tamanho
+            if lead_type == 'ecg':
+                final_features.extend([0.0] * 25)
+            # else:
+            #     final_features.extend([0.0] * 7)
 
     if 'processed_channels' in locals(): del processed_channels
 
@@ -378,11 +445,13 @@ if __name__ == '__main__':
     # Iterate over the records to extract the features and labels.
     features = list()
     labels = list()
+    extraction_times = list()
 
     pbar = tqdm(range(num_records), desc="Extracting Features", unit="record", disable=not verbose)
     for i in pbar:
         try:
             # Extract identifiers for this specific record
+            start_time = time.time()
             record = patient_metadata_list[i]
             patient_id = record[HEADERS['bids_folder']]
             site_id    = record[HEADERS['site_id']]
@@ -398,16 +467,6 @@ if __name__ == '__main__':
 
             # Load signal data.
 
-            # # Load the physiological signal.
-            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-            # --- Check if the file actually exists before proceeding ---
-            if not os.path.exists(physiological_data_file):
-                if verbose:
-                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
-                continue # skip record
-            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
-            physiological_features = extract_physiological_features(physiological_data, physiological_fs, csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
-
             # Load the algorithmic annotations.
             algorithmic_annotations_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
             algorithmic_annotations, algorithmic_fs = load_signal_data(algorithmic_annotations_file)
@@ -417,6 +476,16 @@ if __name__ == '__main__':
             human_annotations_file = os.path.join(data_folder, HUMAN_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_expert_annotations.edf")
             human_annotations, human_fs = load_signal_data(human_annotations_file)
             human_features = extract_human_annotations_features(human_annotations)
+
+            # # Load the physiological signal.
+            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
+            # --- Check if the file actually exists before proceeding ---
+            if not os.path.exists(physiological_data_file):
+                if verbose:
+                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
+                continue # skip record
+            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
+            physiological_features = extract_physiological_features(physiological_data, physiological_fs, algorithmic_annotations, algorithmic_fs,csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
 
             # Load the diagnoses; these data will not be available in the hidden validation and test sets.
             diagnosis_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
@@ -431,6 +500,9 @@ if __name__ == '__main__':
                 features.append(np.hstack([demographic_features, algorithmic_features]))
                 labels.append(label)
 
+            end_time = time.time()
+            extraction_times.append(end_time - start_time)
+
             if 'physiological_data' in locals(): del physiological_data
             if 'algorithmic_annotations' in locals(): del algorithmic_annotations
 
@@ -440,6 +512,13 @@ if __name__ == '__main__':
             continue
 
     pbar.close()
+
+    if verbose and len(extraction_times) > 0:
+        avg_time = sum(extraction_times) / len(extraction_times)
+        max_time = max(extraction_times)
+        print(f"\n--- Relatório de Performance ---")
+        print(f"Tempo médio por registro: {avg_time:.2f} segundos")
+        print(f"Tempo máximo (pior caso): {max_time:.2f} segundos\n")
 
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=bool)
