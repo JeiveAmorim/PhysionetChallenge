@@ -11,10 +11,15 @@
 
 import joblib
 import numpy as np
+import pandas as pd
 import os
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import sys
+from sklearn.model_selection import RandomizedSearchCV
 from tqdm import tqdm
+from scipy.signal import welch
+import antropy as ant
+import yasa
 
 from helper_code import *
 
@@ -78,16 +83,6 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
             # Load signal data.
 
-            # Load the physiological signal.
-            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-            # --- Check if the file actually exists before proceeding ---
-            if not os.path.exists(physiological_data_file):
-                if verbose:
-                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
-                continue # skip record
-            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
-            physiological_features = extract_physiological_features(physiological_data, physiological_fs, csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
-
             # Load the algorithmic annotations.
             algorithmic_annotations_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
             algorithmic_annotations, algorithmic_fs = load_signal_data(algorithmic_annotations_file)
@@ -97,6 +92,16 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
             human_annotations_file = os.path.join(data_folder, HUMAN_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_expert_annotations.edf")
             human_annotations, human_fs = load_signal_data(human_annotations_file)
             human_features = extract_human_annotations_features(human_annotations)
+
+            # Load the physiological signal.
+            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
+            # --- Check if the file actually exists before proceeding ---
+            if not os.path.exists(physiological_data_file):
+                if verbose:
+                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
+                continue # skip record
+            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
+            physiological_features = extract_physiological_features(physiological_data, physiological_fs, algorithmic_annotations, algorithmic_fs,csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
 
             # Load the diagnoses; these data will not be available in the hidden validation and test sets.
             diagnosis_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
@@ -119,29 +124,89 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
     pbar.close()
 
+    # features = np.asarray(features, dtype=np.float32)
+    # labels = np.asarray(labels, dtype=bool)
+
+    # # Train the models on the features.
+    # if verbose:
+    #     print('Training the model on the data...')
+
+    # # This very simple model trains a random forest model with very simple features.
+
+    # # Define the parameters for the random forest classifier and regressor.
+    # n_estimators = 12  # Number of trees in the forest.
+    # max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
+    # random_state = 56  # Random state; set for reproducibility.
+
+    # # Fit the model.
+    # model = RandomForestClassifier(
+    #     n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
+
+    # # Create a folder for the model if it does not already exist.
+    # os.makedirs(model_folder, exist_ok=True)
+
+    # # Save the model.
+    # save_model(model_folder, model)
+
+    # if verbose:
+    #     print('Done.')
+    #     print()
+
+    # ... (Seu código de extração com o tqdm termina aqui) ...
+
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=bool)
 
-    # Train the models on the features.
     if verbose:
-        print('Training the model on the data...')
+        print(f'Iniciando o treinamento e tuning (Shape: {features.shape})...')
 
-    # This very simple model trains a random forest model with very simple features.
+    # Importe no topo do seu arquivo se já não estiver lá:
+    # from sklearn.model_selection import RandomizedSearchCV
 
-    # Define the parameters for the random forest classifier and regressor.
-    n_estimators = 12  # Number of trees in the forest.
-    max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
-    random_state = 56  # Random state; set for reproducibility.
+    # 1. Definimos o "espaço de busca" (As opções que ele vai tentar combinar)
+    param_dist = {
+        'n_estimators': [100, 200, 300, 500],
+        'max_depth': [None, 10, 20, 30],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'max_features': ['sqrt', 'log2']
+    }
 
-    # Fit the model.
-    model = RandomForestClassifier(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
+    # 2. Criamos o modelo base
+    # class_weight='balanced' já ajuda muito com a diferença de saudáveis/doentes!
+    rf_base = RandomForestClassifier(random_state=56, class_weight='balanced')
+
+    # 3. Configuramos o pesquisador
+    # n_iter=20 significa que ele vai testar 20 combinações aleatórias diferentes.
+    # cv=5 significa Validação Cruzada de 5 folds (Robusto contra sorte).
+    # n_jobs=-1 faz ele usar todos os núcleos do seu processador para ir mais rápido!
+    random_search = RandomizedSearchCV(
+        estimator=rf_base, 
+        param_distributions=param_dist, 
+        n_iter=20, 
+        cv=5, 
+        scoring='roc_auc', # Para competições médicas, AUC é melhor que Acurácia
+        n_jobs=-1, 
+        verbose=2,
+        random_state=42
+    )
+
+    # 4. Soltamos a fera nos dados!
+    random_search.fit(features, labels)
+
+    if verbose:
+        print("\n=== Melhores Hiperparâmetros Encontrados ===")
+        print(random_search.best_params_)
+        print(f"Melhor Score (AUC): {random_search.best_score_:.4f}\n")
+
+    # 5. O modelo final que será salvo é o melhor modelo encontrado
+    best_model = random_search.best_estimator_
 
     # Create a folder for the model if it does not already exist.
     os.makedirs(model_folder, exist_ok=True)
 
     # Save the model.
-    save_model(model_folder, model)
+    save_model(model_folder, best_model)
 
     if verbose:
         print('Done.')
@@ -203,6 +268,467 @@ def run_model(model, record, data_folder, verbose):
 #
 ################################################################################
 
+
+def spectral_features(signal, fs):
+
+    BANDS = {
+        "delta": (0.5,4),
+        "theta": (4,8),
+        "alpha": (8,13),
+        "beta": (13,30),
+        "gamma": (30,40)
+    }
+
+
+    freqs, psd = welch(
+        signal,
+        fs=fs,
+        window='hamming',
+        nperseg=5*fs,
+        noverlap=int(2.5*fs)
+    )
+
+    mask = (freqs >= 0.5) & (freqs <= 40)
+    total_power = np.trapz(psd[mask], freqs[mask])
+    total_power = max(total_power, 1e-10)
+
+    features = {}
+
+    for band in BANDS:
+        low, high = BANDS[band]
+        idx = (freqs >= low) & (freqs <= high)
+
+        band_power = np.trapz(psd[idx], freqs[idx])
+
+        features[f"{band}_abs_power"] = band_power
+        features[f"{band}_rel_power"] = band_power / total_power
+
+    features["total_power"] = total_power
+
+    return features
+
+def complexity_features(signal):
+
+    features = {}
+
+    try:
+        features["sample_entropy"] = ant.sample_entropy(signal)
+    except:
+        features["sample_entropy"] = np.nan
+
+    try:
+        features["app_entropy"] = ant.app_entropy(signal)
+    except:
+        features["app_entropy"] = np.nan
+
+    try:
+        features["higuchi_fd"] = ant.higuchi_fd(signal)
+    except:
+        features["higuchi_fd"] = np.nan
+
+    return features
+
+def spindle_features(signal, fs):
+
+    features = {
+        "spindle_count": 0,
+        "spindle_duration_mean": 0,
+        "spindle_amp_mean": 0,
+        "spindle_freq_mean": 0
+    }
+
+    try:
+        sp = yasa.spindles_detect(signal, sf=fs)
+
+        if sp is None:
+            return features
+
+        df = sp.summary()
+
+        if df.empty:
+            return features
+
+        features["spindle_count"] = len(df)
+        features["spindle_duration_mean"] = df["Duration"].mean()
+        features["spindle_amp_mean"] = df["Amplitude"].mean()
+        features["spindle_freq_mean"] = df["Frequency"].mean()
+
+    except:
+        pass
+
+    return features
+
+def slowwave_features(signal, fs):
+
+    features = {
+        "sw_count": 0,
+        "sw_amp_mean": 0,
+        "sw_duration_mean": 0,
+        "sw_slope_mean": 0
+    }
+
+    try:
+        sw = yasa.sw_detect(signal, sf=fs)
+
+        if sw is None:
+            return features
+
+        df = sw.summary()
+
+        if df.empty:
+            return features
+
+        features["sw_count"] = len(df)
+        features["sw_amp_mean"] = df["PTP"].mean()
+        features["sw_duration_mean"] = df["Duration"].mean()
+        features["sw_slope_mean"] = df["Slope"].mean()
+
+    except:
+        pass
+
+    return features
+
+def extract_epoch_features(epoch_signal, fs, stage):
+
+    feat = {}
+
+    # espectral + complexidade sempre
+    feat.update(spectral_features(epoch_signal, fs))
+    feat.update(complexity_features(epoch_signal))
+
+    # spindles apenas N2
+    if stage == "N2":
+        feat.update(spindle_features(epoch_signal, fs))
+    else:
+        feat.update({
+            "spindle_count": 0,
+            "spindle_duration_mean": 0,
+            "spindle_amp_mean": 0,
+            "spindle_freq_mean": 0
+        })
+
+    # slow waves apenas N3
+    if stage == "N3":
+        feat.update(slowwave_features(epoch_signal, fs))
+    else:
+        feat.update({
+            "sw_count": 0,
+            "sw_amp_mean": 0,
+            "sw_duration_mean": 0,
+            "sw_slope_mean": 0
+        })
+
+    return feat
+
+def extract_eeg_features(sig, fs, canais, hypnoIn, epoch_sec=30):
+    """
+    Versão Opção B: Garante saída de tamanho fixo (440 features).
+    """
+    # Canais e Estágios fixos para garantir a ordem do vetor
+    EXPECTED_CHANNELS = ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1']
+    SLEEP_STAGES = ["W", "N1", "N2", "N3", "REM"]
+    
+    # Lista exata das 22 métricas calculadas em extract_epoch_features
+    FEAT_KEYS = [
+        "delta_abs_power", "delta_rel_power", "theta_abs_power", "theta_rel_power",
+        "alpha_abs_power", "alpha_rel_power", "beta_abs_power", "beta_rel_power",
+        "gamma_abs_power", "gamma_rel_power", "total_power",
+        "sample_entropy", "app_entropy", "higuchi_fd",
+        "spindle_count", "spindle_duration_mean", "spindle_amp_mean", "spindle_freq_mean",
+        "sw_count", "sw_amp_mean", "sw_duration_mean", "sw_slope_mean"
+    ]
+
+    # Mapeamento do hipnograma
+    mapeamento = {1: 'W', 2: 'N1', 3: 'N2', 4: 'N3', 5: 'REM', 9: 'NC'}
+    hypno = np.vectorize(mapeamento.get)(hypnoIn)
+
+    # Cria um dicionário para busca rápida dos sinais disponíveis
+    data_map = {c.lower(): (s, f) for s, f, c in zip(sig, fs, canais)}
+    
+    final_vector = []
+    
+    # Loop pelos 4 canais esperados
+    for ch_name in EXPECTED_CHANNELS:
+        if ch_name in data_map:
+            signal_data, fs_ch = data_map[ch_name]
+            epoch_len = int(epoch_sec * fs_ch)
+            
+            # Agrupa épocas por estágio
+            stage_epochs = {s: [] for s in SLEEP_STAGES}
+            for i in range(min(len(hypno), len(signal_data) // epoch_len)):
+                start = i * epoch_len
+                end = start + epoch_len
+                st = hypno[i]
+                if st in SLEEP_STAGES:
+                    stage_epochs[st].append(signal_data[start:end])
+            
+            # Processa cada estágio em ordem fixa
+            for st in SLEEP_STAGES:
+                epochs = stage_epochs[st]
+                if len(epochs) > 0:
+                    # Extrai as 22 features para cada época e tira a média
+                    epoch_results = [extract_epoch_features(ep, fs_ch, st) for ep in epochs]
+                    for k in FEAT_KEYS:
+                        vals = [res.get(k, 0.0) for res in epoch_results]
+                        # nanmean evita que um NaN pontual estrague a média
+                        val_medio = np.nan_to_num(np.nanmean(vals), nan=0.0)
+                        final_vector.append(val_medio)
+                else:
+                    # Estágio ausente para este canal
+                    final_vector.extend([0.0] * 22)
+        else:
+            # Canal inteiro ausente (ex: C3-M2 não encontrado no EDF)
+            final_vector.extend([0.0] * 110) # 5 estágios * 22 métricas
+            
+    return np.array(final_vector).reshape(1, -1)
+
+def extract_hrv_features(sig, fs, sleep_stages, sleep_stages_fs):
+    """
+    Extrai features de tempo e frequência (HRV) para cada estágio do sono.
+    Mapeamento: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake.
+    Retorna um vetor fixo de 25 posições (5 features x 5 estágios).
+    """
+    # Se não tiver dados suficientes, retorna o vetor zerado (25 features)
+    if sig is None or len(sig) < fs * 60 or len(sleep_stages) == 0:
+        return [0.0] * 25
+
+    try:
+        # 1. Detecção de Picos R super rápida (Pan-Tompkins)
+        peaks_info = nk.ecg_peaks(sig, sampling_rate=fs, method="pantompkins1985")[1]
+        r_peaks = peaks_info["ECG_R_Peaks"]
+        
+        if len(r_peaks) < 10:
+            return [0.0] * 25
+
+        # 2. Calcular os Intervalos RR e seus Timestamps
+        rr_times = r_peaks[:-1] / fs  # Em segundos
+        rr_intervals = np.diff(r_peaks) * (1000.0 / fs)  # Em milissegundos
+
+        # 3. Filtro de Sanidade (Remove ruídos de movimento que quebram o HRV)
+        valid_mask = (rr_intervals > 300) & (rr_intervals < 2000)
+        rr_times = rr_times[valid_mask]
+        rr_intervals = rr_intervals[valid_mask]
+
+        # 4. Encontrar o estágio do sono para cada intervalo RR
+        # Época = tempo * frequência_de_amostragem_das_anotações
+        stage_indices = np.floor(rr_times * sleep_stages_fs).astype(int)
+        
+        # Garante que não ultrapassamos o tamanho do array de estágios
+        stage_indices = np.clip(stage_indices, 0, len(sleep_stages) - 1)
+        rr_stages = sleep_stages[stage_indices]
+
+        # 5. Extração de Features Agrupadas por Estágio
+        features = []
+        target_stages = [1, 2, 3, 4, 5] # N3, N2, N1, REM, Wake
+
+        for stage in target_stages:
+            mask = (rr_stages == stage)
+            stage_rrs = rr_intervals[mask]
+            stage_times = rr_times[mask]
+
+            # Se houver pelo menos 20 batimentos válidos neste estágio
+            if len(stage_rrs) > 20:
+                # --- Domínio do Tempo ---
+                sdnn = np.std(stage_rrs, ddof=1)
+                rmssd = np.sqrt(np.mean(np.square(np.diff(stage_rrs))))
+                
+                # --- Domínio da Frequência (Requer Interpolação) ---
+                # Garante que não há tempos duplicados para a interpolação funcionar
+                _, unique_idx = np.unique(stage_times, return_index=True)
+                t_clean = stage_times[unique_idx]
+                rr_clean = stage_rrs[unique_idx]
+
+                if len(t_clean) > 20:
+                    # Interpola para 4Hz (padrão ouro em HRV)
+                    fs_interp = 4.0
+                    t_interp = np.arange(t_clean[0], t_clean[-1], 1.0/fs_interp)
+                    f_interp = scipy.interpolate.interp1d(t_clean, rr_clean, kind='cubic', fill_value='extrapolate')
+                    rr_interp = f_interp(t_interp)
+
+                    # Welch's Periodogram
+                    f, pxx = signal.welch(rr_interp, fs=fs_interp, nperseg=min(256, len(rr_interp)))
+                    
+                    df = f[1] - f[0]
+                    lf = np.sum(pxx[(f >= 0.04) & (f <= 0.15)]) * df
+                    hf = np.sum(pxx[(f >= 0.15) & (f <= 0.40)]) * df
+                    lf_hf = lf / hf if hf > 0 else 0.0
+                else:
+                    lf, hf, lf_hf = 0.0, 0.0, 0.0
+
+                features.extend([rmssd, sdnn, lf, hf, lf_hf])
+            else:
+                # Paciente não teve esse estágio do sono ou sinal estava muito ruim
+                features.extend([np.nan] * 5)
+        
+        return features
+
+    except Exception as e:
+        # Silencia erros para não quebrar o script de avaliação no servidor
+        return [np.nan] * 25
+
+def limpar_sinal_resp(sinal, fs, low_freq, high_freq):
+    """
+    Filtro passa-banda adaptado do membro da equipe para limpar sinais respiratórios.
+    """
+    nyquist = 0.5 * fs
+    low = low_freq / nyquist
+    high = min(high_freq / nyquist, 0.99)
+    if low < high:
+        # Usa o scipy.signal que já está importado como 'signal' no seu topo
+        sos = signal.butter(4, [low, high], btype='bandpass', output='sos')
+        return signal.sosfiltfilt(sos, sinal)
+    return np.asarray(sinal)
+
+def extract_respiratory_features(sig, fs, canais):
+    """ 
+    Extrai features respiratórias (O2, Ronco, Esforço e Fluxo).
+    Espera receber apenas os canais do tipo 'resp' e 'spo2' agrupados.
+    Retorna um array com 6 posições.
+    """
+    # Inicializamos com 0.0 (em vez de NaN) para evitar quebrar a RandomForest
+    features_resp = [0.0] * 6 
+    
+    if not sig or len(sig) == 0:
+        return features_resp
+
+    try:
+        def find_col_idx(keys): 
+            return next((i for i, c in enumerate(canais) if any(k in c.lower() for k in keys)), None)
+
+        idx_o2 = find_col_idx(['spo2', 'sao2', 'osat', 'o2sat'])
+        idx_fluxo = find_col_idx(['ptaf', 'pressure', 'airflow', 'cflow', 'nasal', 'thermistor'])
+        idx_chest = find_col_idx(['chest', 'thorax', 'thoracic'])
+        idx_abd = find_col_idx(['abd', 'abdomen'])
+        
+        def obter_fs(idx):
+            return fs[idx] if isinstance(fs, (list, tuple, np.ndarray)) else fs
+
+        feat_dict = {
+            'T90_Pct': 0.0, 'Carga_Hipoxica': 0.0, 'Instabilidade_O2': 0.0,    
+            'Ronco_Pct': 0.0, 'Var_Fluxo_Resp': 0.0, 'Assincronia_Torax_Abd': 0.0
+        }
+
+        # --- BLOCO 1: SANGUE E OXIGÉNIO ---
+        if idx_o2 is not None:
+            sinal_o2 = np.asarray(sig[idx_o2])
+            fs_o2 = obter_fs(idx_o2)
+            
+            sinal_o2 = np.clip(sinal_o2, a_min=None, a_max=100.0)
+            if sinal_o2.max() <= 1.0: 
+                sinal_o2 *= 100.0
+            
+            feat_dict['T90_Pct'] = ((sinal_o2 < 90.0).sum() / len(sinal_o2)) * 100.0
+            feat_dict['Carga_Hipoxica'] = np.maximum(0, 90.0 - sinal_o2).sum() / fs_o2
+            feat_dict['Instabilidade_O2'] = np.std(np.diff(sinal_o2))
+
+        # --- BLOCO 2: RONCO E FLUXO ---
+        if idx_fluxo is not None:
+            sinal_bruto = np.asarray(sig[idx_fluxo])
+            fs_fluxo = obter_fs(idx_fluxo)
+            
+            # Ronco (> 15 Hz)
+            sinal_ronco = limpar_sinal_resp(sinal_bruto, fs_fluxo, low_freq=15.0, high_freq=fs_fluxo/2.1)
+            energia_ronco = pd.Series(sinal_ronco).abs().rolling(int(fs_fluxo), center=True).mean().bfill().ffill()
+            limiar_ronco = energia_ronco.mean() + (1.5 * energia_ronco.std())
+            feat_dict['Ronco_Pct'] = ((energia_ronco > limiar_ronco).sum() / len(energia_ronco)) * 100.0
+            
+            # Variabilidade da Respiração (0.1 a 3 Hz)
+            sinal_resp = limpar_sinal_resp(sinal_bruto, fs_fluxo, low_freq=0.1, high_freq=3.0)
+            envelope_resp = pd.Series(sinal_resp).abs().rolling(int(fs_fluxo * 2)).mean()
+            if envelope_resp.mean() > 0:
+                feat_dict['Var_Fluxo_Resp'] = envelope_resp.std() / envelope_resp.mean()
+
+        # --- BLOCO 3: ESFORÇO E MECÂNICA ---
+        if idx_chest is not None and idx_abd is not None:
+            sinal_c = np.asarray(sig[idx_chest])
+            fs_c = obter_fs(idx_chest)
+            
+            sinal_a = np.asarray(sig[idx_abd])
+            fs_a = obter_fs(idx_abd)
+            
+            sinal_c_limpo = limpar_sinal_resp(sinal_c, fs_c, low_freq=0.1, high_freq=1.0)
+            sinal_a_limpo = limpar_sinal_resp(sinal_a, fs_a, low_freq=0.1, high_freq=1.0)
+            
+            min_len = min(len(sinal_c_limpo), len(sinal_a_limpo))
+            if min_len > 1:
+                correlacao = np.corrcoef(sinal_c_limpo[:min_len], sinal_a_limpo[:min_len])[0, 1]
+                feat_dict['Assincronia_Torax_Abd'] = 1.0 - correlacao
+
+        # Monta a lista final na mesma ordem
+        features_resp = [
+            feat_dict['T90_Pct'], feat_dict['Carga_Hipoxica'], feat_dict['Instabilidade_O2'],
+            feat_dict['Ronco_Pct'], feat_dict['Var_Fluxo_Resp'], feat_dict['Assincronia_Torax_Abd']
+        ]
+
+    except Exception as e:
+        # Pass silencia o erro e retorna os zeros
+        pass
+        
+    # Garante que não sobrou nenhum NaN que possa quebrar a RandomForest
+    features_resp = np.nan_to_num(features_resp, nan=0.0).tolist()
+    return features_resp
+
+def extract_eog_features(sig, fs):
+    """
+    Extrai features específicas do EOG (Movimento dos olhos).
+    Espera receber uma lista com 2 sinais de EOG (ex: E1 e E2).
+    Retorna exatamente 3 features: [cross_corr, movement_density, spectral_edge_95].
+    """
+    default_out = [0.0, 0.0, 0.0]
+    
+    # Precisamos de exatamente 2 canais para cruzar as informações
+    if not sig or len(sig) < 2:
+        return default_out
+        
+    try:
+        eog1 = np.asarray(sig[0], dtype=np.float64).squeeze()
+        eog2 = np.asarray(sig[1], dtype=np.float64).squeeze()
+        fs_used = float(fs[0])
+        
+        if fs_used <= 0 or eog1.ndim != 1 or eog2.ndim != 1 or len(eog1) < 2 or len(eog2) < 2:
+            return default_out
+            
+        # Iguala o tamanho dos dois sinais caso haja diferença de amostras
+        min_len = min(len(eog1), len(eog2))
+        eog1, eog2 = eog1[:min_len], eog2[:min_len]
+        combined = eog1 - eog2 # A diferença destaca o movimento conjugado dos olhos
+        
+        features = [0.0, 0.0, 0.0]
+        
+        # 1) Cross-correlation (Muito negativa no REM)
+        cross_corr = np.corrcoef(eog1, eog2)[0, 1]
+        if np.isfinite(cross_corr):
+            features[0] = cross_corr
+            
+        # 2) Densidade de Movimento
+        diff_sig = np.abs(np.diff(combined))
+        if len(diff_sig) > 0:
+            threshold = np.percentile(diff_sig, 90)
+            mask = (diff_sig >= threshold).astype(int)
+            events = np.sum((mask[1:] == 1) & (mask[:-1] == 0))
+            duration_min = len(combined) / fs_used / 60.0
+            if duration_min > 0:
+                features[1] = events / duration_min
+                
+        # 3) Spectral Edge 95%
+        nperseg = min(len(combined), int(5 * fs_used))
+        if nperseg >= 8:
+            # Usando a biblioteca signal que já está importada
+            freqs, psd = signal.welch(combined, fs=fs_used, window="hamming", nperseg=nperseg, noverlap=nperseg // 2)
+            mask_f = (freqs >= 0.1) & (freqs <= 15)
+            if np.any(mask_f):
+                psd_sel = psd[mask_f]
+                freqs_sel = freqs[mask_f]
+                if np.sum(psd_sel) > 0:
+                    cumulative = np.cumsum(psd_sel)
+                    idx = np.searchsorted(cumulative, 0.95 * cumulative[-1])
+                    features[2] = freqs_sel[min(idx, len(freqs_sel) - 1)]
+                    
+        return features
+        
+    except Exception as e:
+        return default_out
+
 def extract_demographic_features(data):
     """
     Extracts and encodes demographic features from a metadata dictionary.
@@ -248,31 +774,34 @@ def extract_demographic_features(data):
     
     return np.concatenate([age, sex_vec, race_vec, bmi])
 
-def extract_physiological_features(physiological_data, physiological_fs, csv_path=DEFAULT_CSV_PATH):
+def extract_physiological_features(physiological_data, physiological_fs, algorithmic_annotations, algorithmic_fs, csv_path=DEFAULT_CSV_PATH):
     """
-    Standardizes channels and extracts statistical/spectral features.
+    Standardizes channels and extracts multimodal physiological features.
+    Garante a saída de um vetor de tamanho fixo (488 colunas).
     """
-    original_labels = list(physiological_data.keys())
+    # --- 1. Extração Segura dos Estágios do Sono ---
+    if algorithmic_annotations is not None and 'stage_caisr' in algorithmic_annotations:
+        sleep_stages = algorithmic_annotations['stage_caisr']
+        sleep_stages_fs = algorithmic_fs.get('stage_caisr', 1/30.0)
+    else:
+        sleep_stages = np.array([])
+        sleep_stages_fs = 1/30.0
 
-    # Step 1: Load rules and standardize names
-    # Note: Use script-relative path or absolute path for robustness
+    original_labels = list(physiological_data.keys())
     rename_rules = load_rename_rules(os.path.abspath(csv_path))
     rename_map, cols_to_drop = standardize_channel_names_rename_only(original_labels, rename_rules)
 
-    # Step 2: Apply renaming to BOTH signals and their corresponding FS
     processed_channels = {}
     processed_fs = {}
     for old_label, data in physiological_data.items():
-        if old_label in cols_to_drop:
-            continue
+        if old_label in cols_to_drop: continue
         new_label = rename_map.get(old_label, old_label.lower())
         processed_channels[new_label] = data
-        # Mapping the sampling rate to the new label
-        processed_fs[new_label] = physiological_fs.get(old_label, 200.0) # Default to 200 if missing
+        processed_fs[new_label] = physiological_fs.get(old_label, 200.0) 
     
     if 'physiological_data' in locals(): del physiological_data
 
-    # Step 3: Construct Bipolar Derivations
+    # --- 2. Derivações Bipolares ---
     bipolar_configs = [
         ('f3-m2', 'f3', ['m2']), ('f4-m1', 'f4', ['m1']),
         ('c3-m2', 'c3', ['m2']), ('c4-m1', 'c4', ['m1']),
@@ -281,118 +810,94 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
         ('chin1-chin2', 'chin1', ['chin2']),
         ('lat', 'lleg+', ['lleg-']), ('rat', 'rleg+', ['rleg-'])
     ]
-
     for target, pos, neg_list in bipolar_configs:
-        # 1. Skip if target already exists or pos channel missing
-        if target in processed_channels or pos not in processed_channels:
-            continue
-        
-        # 2. Check all neg channels exist
-        if not all(n in processed_channels for n in neg_list):
-            continue
+        if target in processed_channels or pos not in processed_channels: continue
+        if not all(n in processed_channels for n in neg_list): continue
+        fs_values = [processed_fs[ch] for ch in [pos] + neg_list]
+        if len(set(fs_values)) > 1: continue
 
-        # 3. Check sampling rate consistency
-        all_involved = [pos] + neg_list
-        fs_values = [processed_fs[ch] for ch in all_involved]
-        
-        if len(set(fs_values)) > 1:
-            raise ValueError(f"Sampling rate mismatch for {target}: {dict(zip(all_involved, fs_values))}")
-
-        # 4. Derive bipolar signal
         ref_sig = processed_channels[neg_list[0]] if len(neg_list) == 1 else tuple(processed_channels[n] for n in neg_list)
-        
         derived = derive_bipolar_signal(processed_channels[pos], ref_sig)
-        
         if derived is not None:
             processed_channels[target] = derived
             processed_fs[target] = processed_fs[pos]
 
-    leads_to_check = {
-        'eeg':  ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1'],
-        'eog':  ['e1-m2', 'e2-m1'],
-        'chin': ['chin1-chin2', 'chin'],
-        'leg':  ['lat', 'rat'],
-        'ecg':  ['ecg', 'ekg'],
-        'resp': ['airflow', 'ptaf', 'abd', 'chest'],
-        'spo2': ['spo2', 'sao2'] # Added sao2 as fallback for spo2
-    }
-    
+    # --- 3. Extração Multimodal de Features ---
     final_features = []
-    for lead_type, candidates in leads_to_check.items():
-        sig = None
-        fs = None
-        
-        # Identify the first available candidate
-        for candidate in candidates:
-            if candidate in processed_channels and processed_channels[candidate] is not None:
-                sig = processed_channels[candidate]
-                fs = processed_fs.get(candidate)
-                break 
 
-        # if sig is not None and len(sig) > 0 and fs is not None:
-        #     # --- 1. Time Domain Features ---
-        #     std_val = np.std(sig)
-        #     mav_val = np.mean(np.abs(sig))
-        #     energy_val = np.sum(sig**2) / len(sig)
-            
-        #     # --- 2. Frequency Domain Features (Spectral) ---
-        #     n = len(sig)
-        #     # Correct spacing for frequency axis based on channel-specific fs
-        #     freqs = np.fft.rfftfreq(n, d=1/fs)
-            
-        #     # Compute Power Spectral Density (PSD)
-        #     # Multiplied by 2 for rfft (except DC/Nyquist) and divided by fs for density
-        #     fft_res = np.abs(np.fft.rfft(sig))
-        #     psd = (fft_res**2) / (n * fs)
-            
-        #     # Define band masks
-        #     delta_mask = (freqs >= 0.5) & (freqs <= 4)
-        #     theta_mask = (freqs > 4) & (freqs <= 8)
-        #     alpha_mask = (freqs > 8) & (freqs <= 12)
-            
-        #     # Calculate power in bands using trapezoidal integration for physical accuracy
-        #     delta_p = np.trapezoid(psd[delta_mask], freqs[delta_mask]) if np.any(delta_mask) else 0.0
-        #     theta_p = np.trapezoid(psd[theta_mask], freqs[theta_mask]) if np.any(theta_mask) else 0.0
-        #     alpha_p = np.trapezoid(psd[alpha_mask], freqs[alpha_mask]) if np.any(alpha_mask) else 0.0
-            
-        #     # Ratio biomarker: Delta/Theta (Indicator of cognitive slowing)
-        #     dt_ratio = delta_p / theta_p if theta_p > 0 else 0.0
+    # A) EEG (Opção B - A função garante 440 colunas)
+    eeg_cands = ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1']
+    eeg_sigs, eeg_fss, eeg_names = [], [], []
+    for cand in eeg_cands:
+        if cand in processed_channels:
+            eeg_sigs.append(processed_channels[cand])
+            eeg_fss.append(processed_fs[cand])
+            eeg_names.append(cand)
+    
+    # Passamos todas as listas e damos o flatten para transformar a matriz em vetor 1D
+    eeg_vec = extract_eeg_features(eeg_sigs, eeg_fss, eeg_names, sleep_stages)
+    final_features.extend(eeg_vec.flatten().tolist())
 
-        #     final_features.extend([std_val, mav_val, energy_val, delta_p, theta_p, alpha_p, dt_ratio])
+    # B) ECG (Sempre 25 colunas)
+    ecg_found = False
+    for cand in ['ecg', 'ekg']:
+        if cand in processed_channels:
+            hrv_feats = extract_hrv_features(processed_channels[cand], processed_fs[cand], sleep_stages, sleep_stages_fs)
+            final_features.extend(hrv_feats)
+            ecg_found = True
+            break
+    if not ecg_found: 
+        final_features.extend([0.0] * 25)
 
-        if sig is not None and len(sig) > 1:
-            # --- Time Domain Features (Very Fast) ---
-            std_val = np.std(sig)
-            mav_val = np.mean(np.abs(sig))
-            
-            # Zero Crossing Rate (Proxy for frequency/slowing)
-            zcr = np.mean(np.diff(np.sign(sig)) != 0)
-            
-            # Root Mean Square
-            rms = np.sqrt(np.mean(sig**2))
-            
-            # Signal Activity (Variance)
-            activity = np.var(sig)
-            
-            # Mobility (Hjorth Parameter) - Proxy for mean frequency
-            # sqrt(var(diff(sig)) / var(sig))
-            diff_sig = np.diff(sig)
-            mobility = np.sqrt(np.var(diff_sig) / activity) if activity > 0 else 0.0
+    # C) Respiratório & SpO2 (Sempre 6 colunas)
+    resp_cands = ['airflow', 'ptaf', 'abd', 'chest', 'spo2', 'sao2', 'osat', 'o2sat']
+    r_sigs, r_fss, r_names = [], [], []
+    for cand in resp_cands:
+        if cand in processed_channels:
+            r_sigs.append(processed_channels[cand])
+            r_fss.append(processed_fs[cand])
+            r_names.append(cand)
+    
+    if r_sigs:
+        resp_vec = extract_respiratory_features(r_sigs, r_fss, r_names)
+        final_features.extend(resp_vec)
+    else: 
+        final_features.extend([0.0] * 6)
 
-            # Complexity (Hjorth Parameter) - Proxy for bandwidth
-            diff2_sig = np.diff(diff_sig)
-            var_d2 = np.var(diff2_sig)
-            var_d1 = np.var(diff_sig)
-            complexity = (np.sqrt(var_d2 / var_d1) / mobility) if (var_d1 > 0 and mobility > 0) else 0.0
+    # D) EOG (Sempre 3 colunas)
+    eog_cands = ['e1-m2', 'e2-m1', 'e1', 'e2']
+    eog_sigs, eog_fss = [], []
+    for cand in eog_cands:
+        if cand in processed_channels:
+            eog_sigs.append(processed_channels[cand])
+            eog_fss.append(processed_fs[cand])
+    
+    if len(eog_sigs) >= 2:
+        eog_vec = extract_eog_features(eog_sigs[:2], eog_fss[:2])
+        final_features.extend(eog_vec)
+    else:
+        final_features.extend([0.0] * 3)
 
-            final_features.extend([std_val, mav_val, zcr, rms, activity, mobility, complexity])
-
-        else:
-            # Padding: 7 features per lead type
+    # E) Outros (Chin, Leg - Sempre 7 colunas cada = 14 total)
+    for lead_type in ['chin', 'leg']:
+        cands = {'chin': ['chin1-chin2', 'chin'], 'leg': ['lat', 'rat']}[lead_type]
+        sig_found = False
+        for cand in cands:
+            if cand in processed_channels:
+                s, f = processed_channels[cand], processed_fs[cand]
+                # Extrai estatísticas e Hjorth parameters
+                stats = [np.std(s), np.mean(np.abs(s)), np.mean(np.diff(np.sign(s)) != 0), np.sqrt(np.mean(s**2)), np.var(s)]
+                diff_s = np.diff(s)
+                mob = np.sqrt(np.var(diff_s)/np.var(s)) if np.var(s) > 0 else 0.0
+                comp = (np.sqrt(np.var(np.diff(diff_s))/np.var(diff_s))/mob) if (np.var(diff_s) > 0 and mob > 0) else 0.0
+                
+                final_features.extend(stats + [mob, comp])
+                sig_found = True
+                break
+        if not sig_found: 
             final_features.extend([0.0] * 7)
 
     if 'processed_channels' in locals(): del processed_channels
-
     return np.array(final_features)
 
 def extract_algorithmic_annotations_features(algo_data):

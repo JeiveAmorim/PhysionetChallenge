@@ -1,8 +1,10 @@
 edfio==0.4.13
 joblib==1.5.3
 numpy==2.4.2
-pandas==3.0.1
+pandas==2.3.3
 scikit-learn==1.8.0
 scipy==1.17.1
 tqdm==4.67.3
 kagglehub==1.0.0
+antropy==0.2.1
+yasa==0.7.0
