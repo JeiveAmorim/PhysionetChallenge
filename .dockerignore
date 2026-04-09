@@ -1,0 +1,23 @@
+# Ambiente e Python
+.venv/
+__pycache__/
+*.pyc
+
+# Dados Pesados (Arquivos de Polissonografia) - ISSO É O MAIS IMPORTANTE
+data/
+*.edf
+*.rec
+*.dat
+*.hea
+
+# Artigos relevantes para o projeto
+Artigos/
+*.pdf
+
+# Modelos locais (O Docker deve treinar o dele do zero)
+model/
+*.sav
+
+# Outros
+.ipynb_checkpoints/
+.vscode/

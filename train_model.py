@@ -15,6 +15,12 @@ import sys
 from helper_code import *
 from team_code import train_model
 
+import yasa
+import logging
+
+# Silencia os avisos chatos do YASA, mostrando apenas Erros críticos
+logging.getLogger('yasa').setLevel(logging.ERROR)
+
 # Parse arguments.
 def get_parser():
     description = 'Train the Challenge model.'
