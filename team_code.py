@@ -279,7 +279,6 @@ def spectral_features(signal, fs):
         "gamma": (30,40)
     }
 
-
     freqs, psd = welch(
         signal,
         fs=fs,
@@ -289,7 +288,8 @@ def spectral_features(signal, fs):
     )
 
     mask = (freqs >= 0.5) & (freqs <= 40)
-    total_power = np.trapz(psd[mask], freqs[mask])
+    
+    total_power = np.trapezoid(psd[mask], freqs[mask])
     total_power = max(total_power, 1e-10)
 
     features = {}
@@ -298,7 +298,7 @@ def spectral_features(signal, fs):
         low, high = BANDS[band]
         idx = (freqs >= low) & (freqs <= high)
 
-        band_power = np.trapz(psd[idx], freqs[idx])
+        band_power = np.trapezoid(psd[idx], freqs[idx])
 
         features[f"{band}_abs_power"] = band_power
         features[f"{band}_rel_power"] = band_power / total_power
