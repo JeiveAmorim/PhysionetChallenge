@@ -1,4 +1,4 @@
-FROM python:3.10.1-buster
+FROM python:3.14.3
 
 ## DO NOT EDIT these 3 lines.
 RUN mkdir /challenge
@@ -8,4 +8,6 @@ WORKDIR /challenge
 ## Install your dependencies here using apt install, etc.
 
 ## Include the following line if you have a requirements.txt file.
+RUN pip install --upgrade pip
+
 RUN pip install -r requirements.txt

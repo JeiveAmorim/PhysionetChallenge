@@ -13,13 +13,20 @@ import joblib
 import numpy as np
 import pandas as pd
 import os
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor
 import sys
 from sklearn.model_selection import RandomizedSearchCV
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.ensemble import RandomForestClassifier
 from tqdm import tqdm
 from scipy.signal import welch
 import antropy as ant
+
 import yasa
+import logging
+
+# Silencia os avisos chatos do YASA, mostrando apenas Erros críticos
+logging.getLogger('yasa').setLevel(logging.ERROR)
 
 from helper_code import *
 
@@ -45,172 +52,92 @@ DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 
 # Train your model.
 def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
-    # Find the data files.
     if verbose:
-        print('Finding the Challenge data...')
+        print('Encontrando os dados do Challenge...')
 
     patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
     patient_metadata_list = find_patients(patient_data_file)
     num_records = len(patient_metadata_list)
 
     if num_records == 0:
-        raise FileNotFoundError('No data were provided.')
+        raise FileNotFoundError('Nenhum dado foi fornecido.')
 
-    # Extract the features and labels from the data.
-    if verbose:
-        print('Extracting features and labels from the data...')
-
-    # Iterate over the records to extract the features and labels.
-    features = list()
-    labels = list()
+    features = []
+    labels = []
     
-    pbar = tqdm(range(num_records), desc="Extracting Features", unit="record", disable=not verbose)
+    pbar = tqdm(range(num_records), desc="Extraindo Features", unit="paciente", disable=not verbose)
     for i in pbar:
         try:
-            # Extract identifiers for this specific record
             record = patient_metadata_list[i]
             patient_id = record[HEADERS['bids_folder']]
             site_id    = record[HEADERS['site_id']]
             session_id = record[HEADERS['session_id']]
 
-            if verbose:
-                pbar.set_postfix({"patient": patient_id})
-
-            # Load the patient data.
-            patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
+            # 1. Demografia
             patient_data = load_demographics(patient_data_file, patient_id, session_id)
             demographic_features = extract_demographic_features(patient_data)
 
-            # Load signal data.
+            # 2. Anotações Algorítmicas
+            algo_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
+            if os.path.exists(algo_file):
+                algo_data, algo_fs = load_signal_data(algo_file)
+                algorithmic_features = extract_algorithmic_annotations_features(algo_data)
+            else:
+                algo_data, algo_fs = None, {}
+                algorithmic_features = np.zeros(12)
 
-            # Load the algorithmic annotations.
-            algorithmic_annotations_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
-            algorithmic_annotations, algorithmic_fs = load_signal_data(algorithmic_annotations_file)
-            algorithmic_features = extract_algorithmic_annotations_features(algorithmic_annotations)
+            # 3. Fisiologia Multimodal (O seu vetor de ~48 colunas sem o EEG)
+            phys_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
+            if os.path.exists(phys_file):
+                phys_data, phys_fs = load_signal_data(phys_file)
+                physiological_features = extract_physiological_features(phys_data, phys_fs, algo_data, algo_fs, csv_path=csv_path)
+            else:
+                # O fallback agora deve ter o mesmo tamanho da sua função sem EEG (ajuste se for diferente de 48)
+                physiological_features = np.zeros(48) 
 
-            # Load the human annotations; these data will not be available in the hidden validation and test sets.
-            human_annotations_file = os.path.join(data_folder, HUMAN_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_expert_annotations.edf")
-            human_annotations, human_fs = load_signal_data(human_annotations_file)
-            human_features = extract_human_annotations_features(human_annotations)
+            # 4. Diagnóstico (Label)
+            label = load_diagnoses(patient_data_file, patient_id)
 
-            # Load the physiological signal.
-            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-            # --- Check if the file actually exists before proceeding ---
-            if not os.path.exists(physiological_data_file):
-                if verbose:
-                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
-                continue # skip record
-            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
-            physiological_features = extract_physiological_features(physiological_data, physiological_fs, algorithmic_annotations, algorithmic_fs,csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
-
-            # Load the diagnoses; these data will not be available in the hidden validation and test sets.
-            diagnosis_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-            label = load_diagnoses(diagnosis_file, patient_id)
-
-            # Store the features and labels, but
-            # the human annotations are not available on the hidden validation and test sets, but you
-            # may want to consider how to use them for training.
+            # 5. Concatenação Completa
             if label == 0 or label == 1:
                 features.append(np.hstack([demographic_features, physiological_features, algorithmic_features]))
                 labels.append(label)
 
-            if 'physiological_data' in locals(): del physiological_data
-            if 'algorithmic_annotations' in locals(): del algorithmic_annotations
+            if 'algo_data' in locals(): del algo_data
+            if 'phys_data' in locals(): del phys_data
 
         except Exception as e:
-            # If an error occurs (e.g., a record is corrupted), log it and move to the next
-            tqdm.write(f"  !!! Error processing record {i+1} ({patient_id}): {e}")
+            tqdm.write(f"  !!! Erro ao processar registro {i+1} ({patient_id}): {e}")
             continue
 
     pbar.close()
 
-    # features = np.asarray(features, dtype=np.float32)
-    # labels = np.asarray(labels, dtype=bool)
-
-    # # Train the models on the features.
-    # if verbose:
-    #     print('Training the model on the data...')
-
-    # # This very simple model trains a random forest model with very simple features.
-
-    # # Define the parameters for the random forest classifier and regressor.
-    # n_estimators = 12  # Number of trees in the forest.
-    # max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
-    # random_state = 56  # Random state; set for reproducibility.
-
-    # # Fit the model.
-    # model = RandomForestClassifier(
-    #     n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-
-    # # Create a folder for the model if it does not already exist.
-    # os.makedirs(model_folder, exist_ok=True)
-
-    # # Save the model.
-    # save_model(model_folder, model)
-
-    # if verbose:
-    #     print('Done.')
-    #     print()
-
-    # ... (Seu código de extração com o tqdm termina aqui) ...
-
+    # === TREINAMENTO ===
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=bool)
 
     if verbose:
-        print(f'Iniciando o treinamento e tuning (Shape: {features.shape})...')
+        print(f'\nTamanho total extraído: {features.shape}')
+        print('Treinando a Random Forest definitiva com os hiperparâmetros otimizados...')
 
-    # Importe no topo do seu arquivo se já não estiver lá:
-    # from sklearn.model_selection import RandomizedSearchCV
-
-    # 1. Definimos o "espaço de busca" (As opções que ele vai tentar combinar)
-    param_dist = {
-        'n_estimators': [100, 200, 300, 500],
-        'max_depth': [None, 10, 20, 30],
-        'min_samples_split': [2, 5, 10],
-        'min_samples_leaf': [1, 2, 4],
-        'max_features': ['sqrt', 'log2']
-    }
-
-    # 2. Criamos o modelo base
-    # class_weight='balanced' já ajuda muito com a diferença de saudáveis/doentes!
-    rf_base = RandomForestClassifier(random_state=56, class_weight='balanced')
-
-    # 3. Configuramos o pesquisador
-    # n_iter=20 significa que ele vai testar 20 combinações aleatórias diferentes.
-    # cv=5 significa Validação Cruzada de 5 folds (Robusto contra sorte).
-    # n_jobs=-1 faz ele usar todos os núcleos do seu processador para ir mais rápido!
-    random_search = RandomizedSearchCV(
-        estimator=rf_base, 
-        param_distributions=param_dist, 
-        n_iter=20, 
-        cv=5, 
-        scoring='roc_auc', # Para competições médicas, AUC é melhor que Acurácia
-        n_jobs=-1, 
-        verbose=2,
-        random_state=42
+    model = RandomForestClassifier(
+        n_estimators=300,
+        min_samples_split=10,
+        min_samples_leaf=1,
+        max_features='log2',
+        max_depth=None,
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1
     )
 
-    # 4. Soltamos a fera nos dados!
-    random_search.fit(features, labels)
+    model.fit(features, labels)
 
-    if verbose:
-        print("\n=== Melhores Hiperparâmetros Encontrados ===")
-        print(random_search.best_params_)
-        print(f"Melhor Score (AUC): {random_search.best_score_:.4f}\n")
-
-    # 5. O modelo final que será salvo é o melhor modelo encontrado
-    best_model = random_search.best_estimator_
-
-    # Create a folder for the model if it does not already exist.
     os.makedirs(model_folder, exist_ok=True)
-
-    # Save the model.
-    save_model(model_folder, best_model)
+    save_model(model_folder, model)
 
     if verbose:
-        print('Done.')
-        print()
+        print('Treinamento concluído e modelo salvo com sucesso!')
 
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function. If you do not train one of the models, then you can return None for the model.
@@ -316,10 +243,7 @@ def complexity_features(signal):
     except:
         features["sample_entropy"] = np.nan
 
-    try:
-        features["app_entropy"] = ant.app_entropy(signal)
-    except:
-        features["app_entropy"] = np.nan
+    # app_entropy REMOVIDA AQUI para ganho extremo de performance (Otimização Nível 1)
 
     try:
         features["higuchi_fd"] = ant.higuchi_fd(signal)
@@ -422,38 +346,33 @@ def extract_epoch_features(epoch_signal, fs, stage):
 
 def extract_eeg_features(sig, fs, canais, hypnoIn, epoch_sec=30):
     """
-    Versão Opção B: Garante saída de tamanho fixo (440 features).
+    Versão Otimizada (Sem app_entropy). 
+    Garante saída de tamanho fixo: 4 canais * 5 estágios * 21 features = 420 posições.
     """
-    # Canais e Estágios fixos para garantir a ordem do vetor
     EXPECTED_CHANNELS = ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1']
     SLEEP_STAGES = ["W", "N1", "N2", "N3", "REM"]
     
-    # Lista exata das 22 métricas calculadas em extract_epoch_features
+    # REMOVIDO: "app_entropy" (Agora são 21 features por época)
     FEAT_KEYS = [
         "delta_abs_power", "delta_rel_power", "theta_abs_power", "theta_rel_power",
         "alpha_abs_power", "alpha_rel_power", "beta_abs_power", "beta_rel_power",
         "gamma_abs_power", "gamma_rel_power", "total_power",
-        "sample_entropy", "app_entropy", "higuchi_fd",
+        "sample_entropy", "higuchi_fd",
         "spindle_count", "spindle_duration_mean", "spindle_amp_mean", "spindle_freq_mean",
         "sw_count", "sw_amp_mean", "sw_duration_mean", "sw_slope_mean"
     ]
 
-    # Mapeamento do hipnograma
     mapeamento = {1: 'W', 2: 'N1', 3: 'N2', 4: 'N3', 5: 'REM', 9: 'NC'}
     hypno = np.vectorize(mapeamento.get)(hypnoIn)
 
-    # Cria um dicionário para busca rápida dos sinais disponíveis
     data_map = {c.lower(): (s, f) for s, f, c in zip(sig, fs, canais)}
-    
     final_vector = []
     
-    # Loop pelos 4 canais esperados
     for ch_name in EXPECTED_CHANNELS:
         if ch_name in data_map:
             signal_data, fs_ch = data_map[ch_name]
             epoch_len = int(epoch_sec * fs_ch)
             
-            # Agrupa épocas por estágio
             stage_epochs = {s: [] for s in SLEEP_STAGES}
             for i in range(min(len(hypno), len(signal_data) // epoch_len)):
                 start = i * epoch_len
@@ -462,23 +381,20 @@ def extract_eeg_features(sig, fs, canais, hypnoIn, epoch_sec=30):
                 if st in SLEEP_STAGES:
                     stage_epochs[st].append(signal_data[start:end])
             
-            # Processa cada estágio em ordem fixa
             for st in SLEEP_STAGES:
                 epochs = stage_epochs[st]
                 if len(epochs) > 0:
-                    # Extrai as 22 features para cada época e tira a média
                     epoch_results = [extract_epoch_features(ep, fs_ch, st) for ep in epochs]
                     for k in FEAT_KEYS:
                         vals = [res.get(k, 0.0) for res in epoch_results]
-                        # nanmean evita que um NaN pontual estrague a média
                         val_medio = np.nan_to_num(np.nanmean(vals), nan=0.0)
                         final_vector.append(val_medio)
                 else:
-                    # Estágio ausente para este canal
-                    final_vector.extend([0.0] * 22)
+                    # ATUALIZADO: 21 zeros (estágio ausente)
+                    final_vector.extend([0.0] * 21) 
         else:
-            # Canal inteiro ausente (ex: C3-M2 não encontrado no EDF)
-            final_vector.extend([0.0] * 110) # 5 estágios * 22 métricas
+            # ATUALIZADO: 105 zeros (canal ausente = 5 estágios * 21 métricas)
+            final_vector.extend([0.0] * 105) 
             
     return np.array(final_vector).reshape(1, -1)
 
@@ -825,18 +741,18 @@ def extract_physiological_features(physiological_data, physiological_fs, algorit
     # --- 3. Extração Multimodal de Features ---
     final_features = []
 
-    # A) EEG (Opção B - A função garante 440 colunas)
-    eeg_cands = ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1']
-    eeg_sigs, eeg_fss, eeg_names = [], [], []
-    for cand in eeg_cands:
-        if cand in processed_channels:
-            eeg_sigs.append(processed_channels[cand])
-            eeg_fss.append(processed_fs[cand])
-            eeg_names.append(cand)
+    # # A) EEG (Opção B - A função garante 440 colunas)
+    # eeg_cands = ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1']
+    # eeg_sigs, eeg_fss, eeg_names = [], [], []
+    # for cand in eeg_cands:
+    #     if cand in processed_channels:
+    #         eeg_sigs.append(processed_channels[cand])
+    #         eeg_fss.append(processed_fs[cand])
+    #         eeg_names.append(cand)
     
-    # Passamos todas as listas e damos o flatten para transformar a matriz em vetor 1D
-    eeg_vec = extract_eeg_features(eeg_sigs, eeg_fss, eeg_names, sleep_stages)
-    final_features.extend(eeg_vec.flatten().tolist())
+    # # Passamos todas as listas e damos o flatten para transformar a matriz em vetor 1D
+    # eeg_vec = extract_eeg_features(eeg_sigs, eeg_fss, eeg_names, sleep_stages)
+    # final_features.extend(eeg_vec.flatten().tolist())
 
     # B) ECG (Sempre 25 colunas)
     ecg_found = False
@@ -879,23 +795,23 @@ def extract_physiological_features(physiological_data, physiological_fs, algorit
         final_features.extend([0.0] * 3)
 
     # E) Outros (Chin, Leg - Sempre 7 colunas cada = 14 total)
-    for lead_type in ['chin', 'leg']:
-        cands = {'chin': ['chin1-chin2', 'chin'], 'leg': ['lat', 'rat']}[lead_type]
-        sig_found = False
-        for cand in cands:
-            if cand in processed_channels:
-                s, f = processed_channels[cand], processed_fs[cand]
-                # Extrai estatísticas e Hjorth parameters
-                stats = [np.std(s), np.mean(np.abs(s)), np.mean(np.diff(np.sign(s)) != 0), np.sqrt(np.mean(s**2)), np.var(s)]
-                diff_s = np.diff(s)
-                mob = np.sqrt(np.var(diff_s)/np.var(s)) if np.var(s) > 0 else 0.0
-                comp = (np.sqrt(np.var(np.diff(diff_s))/np.var(diff_s))/mob) if (np.var(diff_s) > 0 and mob > 0) else 0.0
+    # for lead_type in ['chin', 'leg']:
+    #     cands = {'chin': ['chin1-chin2', 'chin'], 'leg': ['lat', 'rat']}[lead_type]
+    #     sig_found = False
+    #     for cand in cands:
+    #         if cand in processed_channels:
+    #             s, f = processed_channels[cand], processed_fs[cand]
+    #             # Extrai estatísticas e Hjorth parameters
+    #             stats = [np.std(s), np.mean(np.abs(s)), np.mean(np.diff(np.sign(s)) != 0), np.sqrt(np.mean(s**2)), np.var(s)]
+    #             diff_s = np.diff(s)
+    #             mob = np.sqrt(np.var(diff_s)/np.var(s)) if np.var(s) > 0 else 0.0
+    #             comp = (np.sqrt(np.var(np.diff(diff_s))/np.var(diff_s))/mob) if (np.var(diff_s) > 0 and mob > 0) else 0.0
                 
-                final_features.extend(stats + [mob, comp])
-                sig_found = True
-                break
-        if not sig_found: 
-            final_features.extend([0.0] * 7)
+    #             final_features.extend(stats + [mob, comp])
+    #             sig_found = True
+    #             break
+    #     if not sig_found: 
+    #         final_features.extend([0.0] * 7)
 
     if 'processed_channels' in locals(): del processed_channels
     return np.array(final_features)

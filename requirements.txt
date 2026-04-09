@@ -8,3 +8,4 @@ tqdm==4.67.3
 kagglehub==1.0.0
 antropy==0.2.1
 yasa==0.7.0
+logging==0.4.9.6
