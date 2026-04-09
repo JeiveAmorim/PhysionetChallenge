@@ -18,51 +18,89 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Build the absolute path to the CSV file relative to the script location
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 
-def extract_demographic_features(data):
+def extract_hrv_features(sig, fs, sleep_stages, sleep_stages_fs):
     """
-    Extracts and encodes demographic features from a metadata dictionary.
-    
-    Inputs:
-        data (dict): A dictionary containing patient metadata (e.g., from a CSV row).
-    
-    Returns:
-        np.array: A feature vector of length 11:
-            - [0]: Age (Continuous)
-            - [1:4]: Sex (One-hot: Female, Male, Other/Unknown)
-            - [4:9]: Race (One-hot: Asian, Black, Other, Unavailable, White)
-            - [9]: BMI (Continuous)
+    Extrai features de tempo e frequência (HRV) para cada estágio do sono.
+    Mapeamento: 1=N3, 2=N2, 3=N1, 4=REM, 5=Wake.
+    Retorna um vetor fixo de 25 posições (5 features x 5 estágios).
     """
-    # 1. Age Feature (1 dimension)
-    # Convert 'Age' to a float; default to 0 if missing
-    # Thats the age of patient at the time of the recording, which is a critical factor in sleep disorders and physiology.
-    age = np.array([load_age(data)])
+    # Se não tiver dados suficientes, retorna o vetor zerado (25 features)
+    if sig is None or len(sig) < fs * 60 or len(sleep_stages) == 0:
+        return [0.0] * 25
 
-    # 2. Sex One-Hot Encoding (3 dimensions: Female, Male, Other/Unknown)
-    # Uses lowercase prefix matching to handle variants like 'F', 'Female', 'M', or 'Male'
-    sex = load_sex(data)
-    sex_vec = np.zeros(3)
-    if sex == 'Female': 
-        sex_vec[0] = 1 # Index 0: Female
-    elif sex == 'Male': 
-        sex_vec[1] = 1 # Index 1: Male
-    else: 
-        sex_vec[2] = 1 # Index 2: Other/Unknown
+    try:
+        # 1. Detecção de Picos R super rápida (Pan-Tompkins)
+        peaks_info = nk.ecg_peaks(sig, sampling_rate=fs, method="pantompkins1985")[1]
+        r_peaks = peaks_info["ECG_R_Peaks"]
+        
+        if len(r_peaks) < 10:
+            return [0.0] * 25
 
-    # 3. Race One-Hot Encoding (6 dimensions)
-    # Standardizes the raw text into one of six categories using the helper function
-    race_category = get_standardized_race(data).lower()
-    race_vec = np.zeros(5)
-    # Pre-defined mapping for index consistency
-    race_mapping = {'asian': 0, 'black': 1, 'others': 2, 'unavailable': 3, 'white': 4}
-    race_vec[race_mapping.get(race_category, 2)] = 1
+        # 2. Calcular os Intervalos RR e seus Timestamps
+        rr_times = r_peaks[:-1] / fs  # Em segundos
+        rr_intervals = np.diff(r_peaks) * (1000.0 / fs)  # Em milissegundos
 
-    # 4. Body Mass Index (BMI) Feature (1 dimension)
-    # Extracts the pre-calculated mean BMI; handles strings, NaNs, and missing keys
-    bmi = np.array([load_bmi(data)])
+        # 3. Filtro de Sanidade (Remove ruídos de movimento que quebram o HRV)
+        valid_mask = (rr_intervals > 300) & (rr_intervals < 2000)
+        rr_times = rr_times[valid_mask]
+        rr_intervals = rr_intervals[valid_mask]
 
-    # 5. Concatenate all components into a single vector (1 + 3 + 5 + 1 = 10)
-    
-    return np.concatenate([age, sex_vec, race_vec, bmi])
+        # 4. Encontrar o estágio do sono para cada intervalo RR
+        # Época = tempo * frequência_de_amostragem_das_anotações
+        stage_indices = np.floor(rr_times * sleep_stages_fs).astype(int)
+        
+        # Garante que não ultrapassamos o tamanho do array de estágios
+        stage_indices = np.clip(stage_indices, 0, len(sleep_stages) - 1)
+        rr_stages = sleep_stages[stage_indices]
+
+        # 5. Extração de Features Agrupadas por Estágio
+        features = []
+        target_stages = [1, 2, 3, 4, 5] # N3, N2, N1, REM, Wake
+
+        for stage in target_stages:
+            mask = (rr_stages == stage)
+            stage_rrs = rr_intervals[mask]
+            stage_times = rr_times[mask]
+
+            # Se houver pelo menos 20 batimentos válidos neste estágio
+            if len(stage_rrs) > 20:
+                # --- Domínio do Tempo ---
+                sdnn = np.std(stage_rrs, ddof=1)
+                rmssd = np.sqrt(np.mean(np.square(np.diff(stage_rrs))))
+                
+                # --- Domínio da Frequência (Requer Interpolação) ---
+                # Garante que não há tempos duplicados para a interpolação funcionar
+                _, unique_idx = np.unique(stage_times, return_index=True)
+                t_clean = stage_times[unique_idx]
+                rr_clean = stage_rrs[unique_idx]
+
+                if len(t_clean) > 20:
+                    # Interpola para 4Hz (padrão ouro em HRV)
+                    fs_interp = 4.0
+                    t_interp = np.arange(t_clean[0], t_clean[-1], 1.0/fs_interp)
+                    f_interp = scipy.interpolate.interp1d(t_clean, rr_clean, kind='cubic', fill_value='extrapolate')
+                    rr_interp = f_interp(t_interp)
+
+                    # Welch's Periodogram
+                    f, pxx = signal.welch(rr_interp, fs=fs_interp, nperseg=min(256, len(rr_interp)))
+                    
+                    df = f[1] - f[0]
+                    lf = np.sum(pxx[(f >= 0.04) & (f <= 0.15)]) * df
+                    hf = np.sum(pxx[(f >= 0.15) & (f <= 0.40)]) * df
+                    lf_hf = lf / hf if hf > 0 else 0.0
+                else:
+                    lf, hf, lf_hf = 0.0, 0.0, 0.0
+
+                features.extend([rmssd, sdnn, lf, hf, lf_hf])
+            else:
+                # Paciente não teve esse estágio do sono ou sinal estava muito ruim
+                features.extend([0.0] * 5)
+        
+        return features
+
+    except Exception as e:
+        # Silencia erros para não quebrar o script de avaliação no servidor
+        return [0.0] * 25
 
 def extract_physiological_features(physiological_data, physiological_fs, algorithmic_annotations, algorithmic_fs, csv_path=DEFAULT_CSV_PATH):
     """
